@@ -1,7 +1,9 @@
 {
   "uuid": "ddc-brightness@genexiz",
   "name": "DDC Brightness",
-  "description": "Brightness slider for external monitors (DDC/CI via ddcutil) in Quick Settings.",
-  "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 1
+  "description": "Brightness slider for external monitors in Quick Settings.\n\nControls monitors over DDC/CI using ddcutil. The slider moves smoothly while brightness is applied in 5% steps, and all monitor I/O runs in a separate helper process so the shell never stalls.\n\nRequires ddcutil and access to /dev/i2c-* (i2c group).",
+  "shell-version": ["50"],
+  "url": "https://github.com/Genexiz/DisplayBrightnessController_Gnome",
+  "version": 1,
+  "version-name": "1.0.0"
 }

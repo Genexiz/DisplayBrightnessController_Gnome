@@ -136,7 +136,8 @@ class DdcBrightnessSlider extends QuickSlider {
     _init() {
         super._init({
             iconName: ICON_NAME,
-            iconLabel: 'External monitor brightness',
+            iconReactive: true,
+            iconLabel: 'Re-read brightness from monitor',
             menuButtonAccessibleName: 'Open monitor brightness menu',
         });
         this.slider.accessible_name = 'External monitor brightness';
@@ -172,7 +173,9 @@ class DdcBrightnessSlider extends QuickSlider {
     setDisplays(displays) {
         this._displays = displays;
         this._section.removeAll();
-        this._displaySliders = displays.map(d => this._addDisplaySlider(d));
+        // Per-monitor sliders only exist when the submenu is usable.
+        this._displaySliders = displays.length > 1
+            ? displays.map(d => this._addDisplaySlider(d)) : [];
         this.menuEnabled = displays.length > 1;
         this.sync();
     }
@@ -235,7 +238,11 @@ class DdcBrightnessSlider extends QuickSlider {
     _updateLabel() {
         const n = this._displays.length;
         const actual = n ? this._displays.reduce((s, d) => s + d.fraction, 0) / n : this.slider.value;
-        this._percent.text = `${Math.round(actual * 100)}%`;
+        // Only touch the label when the text really changes: every text change
+        // relayouts the whole Quick Settings grid.
+        const text = `${Math.round(actual * 100)}%`;
+        if (this._percent.text !== text)
+            this._percent.text = text;
     }
 });
 
@@ -260,6 +267,8 @@ export default class DdcBrightnessExtension extends Extension {
             detected: () => {
                 this._displays = this._found;
                 this._found = [];
+                if (this._displays.length === 0)
+                    console.warn('[ddc-brightness] No DDC/CI capable monitor found (see `ddcutil detect`)');
                 this._indicator.item.setDisplays(this._displays);
                 this._displays.forEach(d => d.requestRead());
             },
@@ -272,22 +281,18 @@ export default class DdcBrightnessExtension extends Extension {
         });
         this._helper.send('detect');
 
-        // Re-read monitor values each time Quick Settings opens, since the
-        // brightness may have been changed with the monitor's own buttons.
-        this._menuOpenId = Main.panel.statusArea.quickSettings.menu.connect(
-            'open-state-changed', (_menu, open) => {
-                if (open)
-                    this._displays.forEach(d => d.requestRead());
-            });
+        // The monitor is deliberately NOT re-read when Quick Settings opens:
+        // on some GPU drivers (seen with NVIDIA) any DDC/CI traffic makes the
+        // mouse cursor stutter, so talking to the monitor is limited to startup, the user's
+        // own changes, and clicking the slider icon (manual re-sync after using
+        // the monitor's buttons).
+        this._indicator.item.connect('icon-clicked',
+            () => this._displays.forEach(d => d.requestRead()));
     }
 
     disable() {
         this._helper?.destroy();
         this._helper = null;
-        if (this._menuOpenId) {
-            Main.panel.statusArea.quickSettings.menu.disconnect(this._menuOpenId);
-            this._menuOpenId = 0;
-        }
         this._indicator?.quickSettingsItems.forEach(i => i.destroy());
         this._indicator?.destroy();
         this._indicator = null;

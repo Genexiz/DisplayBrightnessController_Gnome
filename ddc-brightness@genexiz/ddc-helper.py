@@ -29,7 +29,12 @@ def emit(line):
 
 
 def ddcutil(*args):
-    return subprocess.run(['ddcutil', *args], capture_output=True, text=True)
+    try:
+        return subprocess.run(['ddcutil', *args], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(args, 127, '', 'ddcutil is not installed')
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, '', 'ddcutil timed out')
 
 
 def setvcp(bus, value):
@@ -53,6 +58,8 @@ def getvcp(bus):
 
 def detect():
     res = ddcutil('detect', '--terse')
+    if res.returncode != 0:
+        print(f'ddcutil detect failed: {res.stderr.strip()}', file=sys.stderr, flush=True)
     # Only "Display N" sections are usable; "Invalid display" sections are skipped.
     for section in re.split(r'\n(?=\S)', res.stdout):
         if not re.match(r'Display \d+', section):
