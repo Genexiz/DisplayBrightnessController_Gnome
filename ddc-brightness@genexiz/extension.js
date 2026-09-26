@@ -3,6 +3,7 @@
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 
@@ -20,85 +21,102 @@ const ICON_NAME = 'display-brightness-symbolic';
 // actual brightness close behind the finger.
 const STEP_PERCENT = 5;
 
-Gio._promisify(Gio.Subprocess.prototype, 'communicate_utf8_async');
+Gio._promisify(Gio.DataInputStream.prototype, 'read_line_async');
 
-async function ddcutil(args, cancellable = null) {
-    const proc = Gio.Subprocess.new(['ddcutil', ...args],
-        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
-    const [stdout, stderr] = await proc.communicate_utf8_async(null, cancellable);
-    if (!proc.get_successful())
-        throw new Error(`ddcutil ${args.join(' ')}: ${stderr.trim() || stdout.trim()}`);
-    return stdout;
-}
-
-// Persistent helper process (ddc-helper.py) that performs the writes. Spawning
-// ddcutil directly from gnome-shell on every slider step forks the compositor
-// and makes dragging stutter; writing a line to a pipe is essentially free.
-class WriteHelper {
-    constructor(path) {
+// Persistent helper process (ddc-helper.py) that runs every ddcutil command.
+// gnome-shell itself never forks after startup: forking the compositor stalls
+// its frame loop, which showed up as the slider stuttering.
+class Helper {
+    constructor(path, handlers) {
         this._path = path;
+        this._handlers = handlers;
         this._proc = null;
         this._stdin = null;
+        this._cancellable = new Gio.Cancellable();
+        this._encoder = new TextEncoder();
     }
 
-    send(bus, value) {
+    send(line) {
+        if (this._cancellable.is_cancelled())
+            return;
         try {
             if (!this._proc)
                 this._spawn();
-            this._stdin.write_all(new TextEncoder().encode(`${bus} ${value}\n`), null);
+            this._stdin.write_all(this._encoder.encode(`${line}\n`), null);
         } catch (e) {
             console.warn(`[ddc-brightness] helper: ${e.message}`);
-            this.destroy();
+            this._reset();
         }
     }
 
     _spawn() {
-        this._proc = Gio.Subprocess.new(['python3', this._path], Gio.SubprocessFlags.STDIN_PIPE);
-        this._stdin = this._proc.get_stdin_pipe();
-        this._proc.wait_async(null, () => {
-            this._proc = null;
-            this._stdin = null;
+        const proc = Gio.Subprocess.new(['python3', this._path],
+            Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE);
+        this._proc = proc;
+        this._stdin = proc.get_stdin_pipe();
+        this._readLoop(new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()}))
+            .catch(logError);
+        proc.wait_async(null, () => {
+            if (this._proc === proc)
+                this._reset();
         });
     }
 
+    async _readLoop(stream) {
+        for (;;) {
+            const [line] = await stream.read_line_async(GLib.PRIORITY_DEFAULT, this._cancellable);
+            if (line === null)
+                return;
+            const [kind, ...args] = new TextDecoder().decode(line).split(' ');
+            this._handlers[kind]?.(...args);
+        }
+    }
+
+    _reset() {
+        this._proc = null;
+        this._stdin = null;
+    }
+
     destroy() {
+        this._cancellable.cancel();
         // Closing stdin makes the helper exit on its own.
         try {
             this._stdin?.close(null);
         } catch {}
-        this._proc = null;
-        this._stdin = null;
+        this._reset();
     }
 }
 
 // One physical monitor reachable over DDC/CI.
 class Display {
-    constructor(bus, name, helper, cancellable) {
+    constructor(bus, name, helper) {
         this.bus = bus;
         this.name = name;
         this.max = 100;
         this.value = 0;
+        this.known = false;
         this._helper = helper;
-        this._cancellable = cancellable;
-        this._lastWrite = 0;
-    }
-
-    async read() {
-        // Don't clobber a value that was just written and may still be in flight.
-        if (Date.now() - this._lastWrite < 3000)
-            return;
-        // Terse output: "VCP 10 C <current> <max>"
-        const out = await ddcutil(['--bus', this.bus, '--terse', 'getvcp', VCP_BRIGHTNESS],
-            this._cancellable);
-        const m = out.match(/VCP\s+10\s+C\s+(\d+)\s+(\d+)/);
-        if (!m)
-            throw new Error(`Unexpected getvcp output: ${out}`);
-        this.value = Number(m[1]);
-        this.max = Number(m[2]) || 100;
+        this._writes = 0;
+        this._writesAtRead = 0;
     }
 
     get fraction() {
         return this.value / this.max;
+    }
+
+    requestRead() {
+        this._writesAtRead = this._writes;
+        this._helper.send(`get ${this.bus}`);
+    }
+
+    // Returns false when the reading is stale (a write happened after it was requested).
+    applyReading(current, max) {
+        if (this._writes !== this._writesAtRead)
+            return false;
+        this.value = current;
+        this.max = max || 100;
+        this.known = true;
+        return true;
     }
 
     setFraction(fraction) {
@@ -108,26 +126,9 @@ class Display {
         if (value === this.value)
             return;
         this.value = value;
-        this._lastWrite = Date.now();
-        this._helper.send(this.bus, value);
+        this._writes++;
+        this._helper.send(`set ${this.bus} ${value}`);
     }
-}
-
-async function detectDisplays(helper, cancellable) {
-    const out = await ddcutil(['detect', '--terse'], cancellable);
-    const displays = [];
-    // Only "Display N" sections are usable; "Invalid display" sections are skipped.
-    for (const section of out.split(/\n(?=\S)/)) {
-        if (!/^Display \d+/.test(section))
-            continue;
-        const bus = section.match(/I2C bus:\s+\/dev\/i2c-(\d+)/)?.[1];
-        if (!bus)
-            continue;
-        const monitor = section.match(/Monitor:\s+(.*)/)?.[1] ?? '';
-        const [, model = ''] = monitor.split(':');
-        displays.push(new Display(bus, model.trim() || `Monitor (i2c-${bus})`, helper, cancellable));
-    }
-    return displays;
 }
 
 const DdcBrightnessSlider = GObject.registerClass(
@@ -152,6 +153,8 @@ class DdcBrightnessSlider extends QuickSlider {
 
         this._displays = [];
         this._blocked = false;
+        this._dragging = false;
+        this._trackDrag(this.slider);
         this.slider.connect('notify::value', () => {
             if (this._blocked)
                 return;
@@ -170,10 +173,7 @@ class DdcBrightnessSlider extends QuickSlider {
         this._displays = displays;
         this._section.removeAll();
         this._displaySliders = displays.map(d => this._addDisplaySlider(d));
-        this.set({
-            visible: displays.length > 0,
-            menuEnabled: displays.length > 1,
-        });
+        this.menuEnabled = displays.length > 1;
         this.sync();
     }
 
@@ -191,6 +191,7 @@ class DdcBrightnessSlider extends QuickSlider {
             y_align: Clutter.ActorAlign.CENTER,
         }));
         this._section.addMenuItem(item);
+        this._trackDrag(slider);
         slider.connect('notify::value', () => {
             if (this._blocked)
                 return;
@@ -217,7 +218,16 @@ class DdcBrightnessSlider extends QuickSlider {
         this._blocked = false;
     }
 
+    // Like GNOME's volume slider: never move a slider under the user's pointer.
+    _trackDrag(slider) {
+        slider.connect('drag-begin', () => (this._dragging = true));
+        slider.connect('drag-end', () => (this._dragging = false));
+    }
+
     sync() {
+        if (this._dragging)
+            return;
+        this.visible = this._displays.some(d => d.known);
         this._syncPerDisplay();
         this._syncMain();
     }
@@ -240,26 +250,38 @@ class DdcBrightnessIndicator extends SystemIndicator {
 
 export default class DdcBrightnessExtension extends Extension {
     enable() {
-        this._cancellable = new Gio.Cancellable();
-        this._helper = new WriteHelper(`${this.path}/ddc-helper.py`);
         this._displays = [];
+        this._found = [];
         this._indicator = new DdcBrightnessIndicator();
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator, 2);
+
+        this._helper = new Helper(`${this.path}/ddc-helper.py`, {
+            display: (bus, ...name) => this._found.push(new Display(bus, name.join(' '), this._helper)),
+            detected: () => {
+                this._displays = this._found;
+                this._found = [];
+                this._indicator.item.setDisplays(this._displays);
+                this._displays.forEach(d => d.requestRead());
+            },
+            value: (bus, current, max) => {
+                const display = this._displays.find(d => d.bus === bus);
+                if (display?.applyReading(Number(current), Number(max)))
+                    this._indicator.item.sync();
+            },
+            error: (bus, ...msg) => console.warn(`[ddc-brightness] i2c-${bus}: ${msg.join(' ')}`),
+        });
+        this._helper.send('detect');
 
         // Re-read monitor values each time Quick Settings opens, since the
         // brightness may have been changed with the monitor's own buttons.
         this._menuOpenId = Main.panel.statusArea.quickSettings.menu.connect(
             'open-state-changed', (_menu, open) => {
                 if (open)
-                    this._refresh().catch(logError);
+                    this._displays.forEach(d => d.requestRead());
             });
-
-        this._setup().catch(logError);
     }
 
     disable() {
-        this._cancellable?.cancel();
-        this._cancellable = null;
         this._helper?.destroy();
         this._helper = null;
         if (this._menuOpenId) {
@@ -270,27 +292,6 @@ export default class DdcBrightnessExtension extends Extension {
         this._indicator?.destroy();
         this._indicator = null;
         this._displays = [];
-    }
-
-    async _setup() {
-        const cancellable = this._cancellable;
-        const displays = await detectDisplays(this._helper, cancellable);
-        if (cancellable.is_cancelled())
-            return;
-        this._displays = displays;
-        await this._refresh();
-        if (!cancellable.is_cancelled())
-            this._indicator.item.setDisplays(displays);
-    }
-
-    async _refresh() {
-        const cancellable = this._cancellable;
-        const results = await Promise.allSettled(this._displays.map(d => d.read()));
-        if (!cancellable || cancellable.is_cancelled())
-            return;
-        results.filter(r => r.status === 'rejected')
-            .forEach(r => console.warn(`[ddc-brightness] ${r.reason.message}`));
-        this._indicator?.item.sync();
     }
 }
 

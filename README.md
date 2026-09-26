@@ -15,11 +15,11 @@ Control Center / Quick Settings มุมขวาบนของ Ubuntu โด�
 ## สถาปัตยกรรม
 
 ```
-Slider (GNOME Shell, GJS)
-   │  notify::value  → เขียน "bus value" ลง pipe (ไม่ fork, ไม่บล็อก UI)
-   ▼
-ddc-helper.py  (โปรเซสเดียว เปิดค้างไว้)
-   │  อ่านทุกค่าที่ค้างใน pipe แล้วใช้เฉพาะค่าล่าสุดของแต่ละจอ
+Slider (GNOME Shell, GJS) ── ลากลื่นตามเมาส์, ไม่มีการ fork ใดๆ หลังเปิด extension
+   │  stdin:  detect | get <bus> | set <bus> <value>
+   ▼        stdout: display … | detected | value <bus> <cur> <max>
+ddc-helper.py  (โปรเซสเดียว เปิดตั้งแต่ enable)
+   │  รวบคำสั่งที่ค้าง: ใช้ set ล่าสุดต่อจอ → detect → get
    ▼
 ddcutil --bus N --noverify --skip-ddc-checks --sleep-multiplier 0.2 setvcp 10 <value>
    │  I²C /dev/i2c-N   (~0.14 วินาที/คำสั่ง, ถ้าล้มเหลวลองใหม่ด้วยโหมดปกติ)
@@ -27,12 +27,11 @@ ddcutil --bus N --noverify --skip-ddc-checks --sleep-multiplier 0.2 setvcp 10 <v
 จอ (DDC/CI, VCP 0x10 = Brightness)
 ```
 
-- **ตรวจหาจอ** – `ddcutil detect --terse` ตอนเปิดใช้ extension
-- **อ่านค่า** – `ddcutil --bus N getvcp 10` ตอนเริ่มและทุกครั้งที่เปิด Quick Settings
-  (เผื่อปรับด้วยปุ่มบนจอไว้)
-- **เขียนค่า** – gnome-shell ไม่ spawn `ddcutil` เองระหว่างลาก (การ fork
-  compositor ทำให้กระตุก) แต่ส่งค่าไปให้ `ddc-helper.py` ซึ่งรวบค่าที่ค้างอยู่
-  และส่งเฉพาะค่าล่าสุดไปที่จอ
+- **ไม่ fork gnome-shell** – การ fork compositor (ซึ่งใช้หน่วยความจำเยอะ) ทำให้ทั้งจอค้างชั่วขณะ
+  งาน ddcutil ทั้งหมด (ค้นหาจอ / อ่าน / เขียน) จึงไปทำใน `ddc-helper.py`
+- **อ่านค่า** – ทุกครั้งที่เปิด Quick Settings (เผื่อปรับด้วยปุ่มบนจอไว้) แต่ถ้ากำลังลากอยู่
+  หรือมีการเขียนค่าหลังจากสั่งอ่าน ค่าที่อ่านได้จะถูกทิ้ง — สไลเดอร์จะไม่ถูกดีดกลับ
+  (หลักการเดียวกับสไลเดอร์เสียงของ GNOME)
 - **ปรับเป็นขั้น** – สไลเดอร์เลื่อนลื่นตามเมาส์ แต่ส่งค่าไปจอเฉพาะเมื่อข้ามขั้นละ 5%
   (`STEP_PERCENT` ใน `extension.js`) ตัวเลข % แสดงค่าจริงที่จอได้รับ
 - **หลายจอ** – สไลเดอร์หลักปรับทุกจอพร้อมกัน, ปุ่ม `›` เปิดเมนูปรับแยกทีละจอ
