@@ -1,0 +1,7 @@
+{
+  "uuid": "ddc-brightness@genexiz",
+  "name": "DDC Brightness",
+  "description": "Brightness slider for external monitors (DDC/CI via ddcutil) in Quick Settings.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}
